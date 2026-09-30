@@ -33,7 +33,7 @@ Tools:
      consistent with a manual mute or gain change
 
 Run:
-  streamlit run fvtr_app.py
+  streamlit run fshr_app.py   (then open "Audio Layer" in the sidebar)
 """
 
 import io
@@ -43,6 +43,7 @@ import numpy as np
 import streamlit as st
 from scipy import signal
 from scipy.io import wavfile
+from scipy.ndimage import binary_closing, median_filter
 
 try:
     import matplotlib.pyplot as plt
@@ -155,11 +156,21 @@ def bandpass_filter(data: np.ndarray, sr: int, low_hz: float = 300, high_hz: flo
 
 
 def detect_transients(
-    data: np.ndarray, sr: int, frame_ms: float = 10.0, thresh_db: float = -25.0, max_duration_s: float = 0.5
+    data: np.ndarray,
+    sr: int,
+    frame_ms: float = 10.0,
+    rise_db: float = 6.0,
+    max_duration_s: float = 0.5,
+    background_s: float = 1.0,
+    floor_db: float = -60.0,
 ) -> list[dict]:
     """
-    Flag short amplitude bursts (RMS envelope above `thresh_db`, lasting no
-    longer than `max_duration_s`) — candidate impact / vocal-onset events.
+    Flag short bursts where the RMS envelope rises at least `rise_db` above
+    its local background (rolling median over `background_s`) for no longer
+    than `max_duration_s`. Measuring against the local background lets a
+    burst register even when it sits on top of continuous sound. The first
+    and last 100 ms are skipped: STFT/filtfilt edge effects cause spurious
+    rises there.
     """
     frame_len = max(1, int(sr * frame_ms / 1000))
     n_frames = len(data) // frame_len
@@ -169,7 +180,14 @@ def detect_transients(
     frames = data[: n_frames * frame_len].reshape(n_frames, frame_len)
     rms = np.sqrt(np.mean(frames**2, axis=1) + 1e-12)
     env_db = 20 * np.log10(rms + 1e-12)
-    above = env_db > thresh_db
+    win = max(3, int(background_s * 1000 / frame_ms) | 1)
+    background = median_filter(env_db, size=win, mode="nearest")
+    rise = env_db - background
+    above = (rise > rise_db) & (env_db > floor_db)
+    above = binary_closing(above, structure=np.ones(3, dtype=bool))
+    edge = int(100 / frame_ms)
+    above[:edge] = False
+    above[-edge:] = False
 
     events = []
     i = 0
@@ -186,6 +204,7 @@ def detect_transients(
                         "end_s": round(j * frame_len / sr, 3),
                         "duration_s": round(duration, 3),
                         "peak_db": round(float(env_db[i:j].max()), 1),
+                        "rise_db": round(float(rise[i:j].max()), 1),
                     }
                 )
             i = j
@@ -245,7 +264,11 @@ def plot_waveform(data: np.ndarray, sr: int, title: str, highlight: list[dict] |
     ax.plot(t, data, linewidth=0.5, color="#2b6cb0")
     if highlight:
         for ev in highlight:
-            ax.axvspan(ev.get("start_s", ev.get("time_s")), ev.get("end_s", ev.get("time_s") + 0.02), color="#e53e3e", alpha=0.4)
+            if "start_s" in ev:
+                start, end = ev["start_s"], ev["end_s"]
+            else:
+                start, end = ev["time_s"], ev["time_s"] + 0.02
+            ax.axvspan(start, end, color="#e53e3e", alpha=0.4)
     ax.set_title(title)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Amplitude")
@@ -311,7 +334,8 @@ with st.sidebar:
     st.subheader("2. Vocal Band-Pass + Transients")
     low_hz = st.slider("Band-pass low (Hz)", 50, 1000, 300, 10)
     high_hz = st.slider("Band-pass high (Hz)", 1000, 8000, 3400, 100)
-    trans_thresh = st.slider("Transient threshold (dB)", -60, 0, -25, 1)
+    trans_rise = st.slider("Transient rise above background (dB)", 3, 30, 6, 1,
+                           help="How far a burst must jump above the surrounding ~1 s of audio.")
     trans_max_dur = st.slider("Max transient duration (s)", 0.05, 2.0, 0.5, 0.05)
 
     st.subheader("3. Clarity Enhancement")
@@ -390,7 +414,7 @@ with tab_vocal:
 
     denoised = st.session_state.get("fvtr_denoised", raw)
     filtered = bandpass_filter(denoised, sr, low_hz=low_hz, high_hz=high_hz)
-    transients = detect_transients(filtered, sr, thresh_db=trans_thresh, max_duration_s=trans_max_dur)
+    transients = detect_transients(filtered, sr, rise_db=trans_rise, max_duration_s=trans_max_dur)
 
     plot_waveform(filtered, sr, "Band-passed waveform (red = flagged transients)", highlight=transients)
     st.audio(to_wav_bytes(sr, filtered), format="audio/wav")
