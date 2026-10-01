@@ -4,3 +4,4 @@ numpy
 Pillow
 scipy
 matplotlib
+soundfile>=0.12
